@@ -1,0 +1,2 @@
+-keep class com.tickethelper.service.** { *; }
+-keep class com.tickethelper.engine.** { *; }
