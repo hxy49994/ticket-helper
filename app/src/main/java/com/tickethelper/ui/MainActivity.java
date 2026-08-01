@@ -146,9 +146,10 @@ public class MainActivity extends AppCompatActivity implements GrabState.StateCa
         List<AccessibilityServiceInfo> enabledServices = am.getEnabledAccessibilityServiceList(
                 AccessibilityServiceInfo.FEEDBACK_ALL_MASK);
         boolean found = false;
+        ComponentName targetComponent = new ComponentName(this, GrabAccessibilityService.class);
         for (AccessibilityServiceInfo info : enabledServices) {
-            ComponentName componentName = new ComponentName(this, GrabAccessibilityService.class);
-            if (info.getComponentName() != null && info.getComponentName().equals(componentName)) {
+            String id = info.getId();
+            if (id != null && id.equals(targetComponent.flattenToString())) {
                 found = true;
                 break;
             }
