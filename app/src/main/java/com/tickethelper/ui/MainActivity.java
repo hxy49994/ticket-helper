@@ -7,13 +7,14 @@ import android.content.Intent;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.CountDownTimer;
 import android.os.Handler;
 import android.os.Looper;
 import android.provider.Settings;
 import android.util.Log;
 import android.view.View;
-import android.view.ViewGroup;
 import android.view.accessibility.AccessibilityManager;
+import android.widget.Button;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -22,35 +23,47 @@ import androidx.appcompat.app.AppCompatActivity;
 import com.google.android.material.button.MaterialButton;
 import com.google.android.material.slider.Slider;
 import com.tickethelper.R;
+import com.tickethelper.engine.AppDetector;
 import com.tickethelper.engine.GrabConfig;
 import com.tickethelper.engine.GrabState;
-import com.tickethelper.service.FloatingButtonService;
 import com.tickethelper.service.GrabAccessibilityService;
 
+import java.text.SimpleDateFormat;
+import java.util.Calendar;
+import java.util.Date;
 import java.util.List;
+import java.util.Locale;
 
-public class MainActivity extends AppCompatActivity implements GrabState.StateCallback {
+public class MainActivity extends AppCompatActivity implements GrabState.Callback {
     private static final String TAG = "MainActivity";
     private static final String DAMAI_PACKAGE = "com.damai";
-    private static final int OVERLAY_PERMISSION_REQUEST = 1001;
 
+    // 服务状态
     private TextView tvServiceStatus;
-    private TextView tvStepStatus;
-    private MaterialButton btnStartStop;
-    private MaterialButton btnOpenDamai;
     private MaterialButton btnOpenSettings;
-    private MaterialButton btnFloatToggle;
+
+    // 大麦检测
+    private TextView tvDamaiStatus;
+    private MaterialButton btnOpenDamai;
+    private MaterialButton btnOpenDamaiInfo;
+
+    // 抢票配置
+    private Slider sliderHour, sliderMinute;
+    private TextView tvTimeDisplay;
+    private Slider sliderSession, sliderTicket;
+    private TextView tvSessionVal, tvTicketVal;
+
+    // 控制
+    private MaterialButton btnStartScheduled, btnStartNow;
+    private TextView tvCountdown, tvStepStatus;
+
+    // 日志
     private TextView tvLog;
-    private Slider sliderSession;
-    private Slider sliderTicket;
-    private Slider sliderInterval;
-    private Slider sliderRetry;
-    private TextView tvSessionVal;
-    private TextView tvTicketVal;
-    private TextView tvIntervalVal;
-    private TextView tvRetryVal;
     private StringBuilder logBuilder = new StringBuilder();
-    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+
+    private final Handler handler = new Handler(Looper.getMainLooper());
+    private CountDownTimer countDownTimer;
+    private boolean isRunning = false;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -58,17 +71,16 @@ public class MainActivity extends AppCompatActivity implements GrabState.StateCa
         setContentView(R.layout.activity_main);
         initViews();
         initListeners();
-        checkAccessibilityService();
+        refreshStatus();
     }
 
     @Override
     protected void onResume() {
         super.onResume();
-        checkAccessibilityService();
+        refreshStatus();
         GrabAccessibilityService service = GrabAccessibilityService.getInstance();
         if (service != null) {
-            service.setStateCallback(this);
-            updateServiceStatus(true, service.isGrabbing());
+            service.setCallback(this);
         }
     }
 
@@ -77,215 +89,283 @@ public class MainActivity extends AppCompatActivity implements GrabState.StateCa
         super.onPause();
         GrabAccessibilityService service = GrabAccessibilityService.getInstance();
         if (service != null) {
-            service.setStateCallback(null);
+            service.setCallback(null);
         }
     }
 
     @Override
     protected void onDestroy() {
         super.onDestroy();
-        mainHandler.removeCallbacksAndMessages(null);
-        stopFloatingService();
-    }
-
-    @Override
-    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
-        super.onActivityResult(requestCode, resultCode, data);
-        if (requestCode == OVERLAY_PERMISSION_REQUEST) {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && Settings.canDrawOverlays(this)) {
-                startFloatingService();
-                addLog("悬浮窗权限已授予，悬浮按钮已显示");
-            } else {
-                Toast.makeText(this, "需要悬浮窗权限", Toast.LENGTH_SHORT).show();
-            }
-        }
+        if (countDownTimer != null) countDownTimer.cancel();
+        handler.removeCallbacksAndMessages(null);
     }
 
     private void initViews() {
         tvServiceStatus = findViewById(R.id.tv_service_status);
-        tvStepStatus = findViewById(R.id.tv_step_status);
-        btnStartStop = findViewById(R.id.btn_start_stop);
-        btnOpenDamai = findViewById(R.id.btn_open_damai);
         btnOpenSettings = findViewById(R.id.btn_open_settings);
-        btnFloatToggle = findViewById(R.id.btn_float_toggle);
-        tvLog = findViewById(R.id.tv_log);
+        tvDamaiStatus = findViewById(R.id.tv_damai_status);
+        btnOpenDamai = findViewById(R.id.btn_open_damai);
+        btnOpenDamaiInfo = findViewById(R.id.btn_open_damai_info);
+
+        sliderHour = findViewById(R.id.slider_hour);
+        sliderMinute = findViewById(R.id.slider_minute);
+        tvTimeDisplay = findViewById(R.id.tv_time_display);
+
         sliderSession = findViewById(R.id.slider_session);
         sliderTicket = findViewById(R.id.slider_ticket);
-        sliderInterval = findViewById(R.id.slider_interval);
-        sliderRetry = findViewById(R.id.slider_retry);
         tvSessionVal = findViewById(R.id.tv_session_val);
         tvTicketVal = findViewById(R.id.tv_ticket_val);
-        tvIntervalVal = findViewById(R.id.tv_interval_val);
-        tvRetryVal = findViewById(R.id.tv_retry_val);
+
+        btnStartScheduled = findViewById(R.id.btn_start_scheduled);
+        btnStartNow = findViewById(R.id.btn_start_now);
+        tvCountdown = findViewById(R.id.tv_countdown);
+        tvStepStatus = findViewById(R.id.tv_step_status);
+        tvLog = findViewById(R.id.tv_log);
     }
 
     private void initListeners() {
-        btnOpenSettings.setOnClickListener(v -> openAccessibilitySettings());
-        btnOpenDamai.setOnClickListener(v -> openDamai());
-        btnStartStop.setOnClickListener(v -> toggleGrabbing());
-        btnFloatToggle.setOnClickListener(v -> toggleFloatingButton());
+        btnOpenSettings.setOnClickListener(v -> {
+            try {
+                startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS));
+                Toast.makeText(this, "请找到「抢票助手」并开启", Toast.LENGTH_LONG).show();
+            } catch (Exception e) {
+                Toast.makeText(this, "请手动进入: 设置→辅助功能→无障碍", Toast.LENGTH_LONG).show();
+            }
+        });
 
-        sliderSession.addOnChangeListener((slider, value, fromUser) ->
-                tvSessionVal.setText(String.valueOf((int) value + 1)));
-        sliderTicket.addOnChangeListener((slider, value, fromUser) ->
-                tvTicketVal.setText(String.valueOf((int) value + 1)));
-        sliderInterval.addOnChangeListener((slider, value, fromUser) ->
-                tvIntervalVal.setText(String.valueOf((int) value)));
-        sliderRetry.addOnChangeListener((slider, value, fromUser) ->
-                tvRetryVal.setText(String.valueOf((int) value)));
+        btnOpenDamai.setOnClickListener(v -> {
+            boolean ok = AppDetector.openApp(this, DAMAI_PACKAGE);
+            if (!ok) {
+                Toast.makeText(this, "未安装大麦，请先安装", Toast.LENGTH_SHORT).show();
+            }
+            refreshStatus();
+        });
+
+        btnOpenDamaiInfo.setOnClickListener(v -> {
+            AppDetector.openAppInfo(this, DAMAI_PACKAGE);
+        });
+
+        // 时间滑块
+        sliderHour.setLabelFormatter(value -> String.format("%02d:xx", (int) value));
+        sliderMinute.setLabelFormatter(value -> String.format("xx:%02d", (int) value));
+        updateTimeDisplay();
+
+        sliderHour.addOnChangeListener((s, v, u) -> updateTimeDisplay());
+        sliderMinute.addOnChangeListener((s, v, u) -> updateTimeDisplay());
+
+        sliderSession.addOnChangeListener((s, v, u) ->
+                tvSessionVal.setText(String.valueOf((int) v + 1)));
+        sliderTicket.addOnChangeListener((s, v, u) ->
+                tvTicketVal.setText(String.valueOf((int) v + 1)));
 
         tvSessionVal.setText("1");
         tvTicketVal.setText("1");
-        tvIntervalVal.setText("500");
-        tvRetryVal.setText("30");
-    }
 
-    private void checkAccessibilityService() {
-        AccessibilityManager am = (AccessibilityManager) getSystemService(Context.ACCESSIBILITY_SERVICE);
-        if (am == null) {
-            updateServiceStatus(false, false);
-            return;
-        }
-        List<AccessibilityServiceInfo> enabledServices = am.getEnabledAccessibilityServiceList(
-                AccessibilityServiceInfo.FEEDBACK_ALL_MASK);
-        boolean found = false;
-        ComponentName targetComponent = new ComponentName(this, GrabAccessibilityService.class);
-        for (AccessibilityServiceInfo info : enabledServices) {
-            String id = info.getId();
-            if (id != null && id.equals(targetComponent.flattenToString())) {
-                found = true;
-                break;
-            }
-        }
-        updateServiceStatus(found, false);
-        btnOpenSettings.setVisibility(found ? View.GONE : View.VISIBLE);
-        // 通知悬浮服务状态变化
-        Intent intent = new Intent(this, FloatingButtonService.class);
-        intent.setAction("SET_ENABLED");
-        intent.putExtra("enabled", found);
-        startService(intent);
-    }
-
-    private void updateServiceStatus(boolean enabled, boolean grabbing) {
-        runOnUiThread(() -> {
-            if (enabled) {
-                tvServiceStatus.setText("无障碍服务已开启 ✓");
-                tvServiceStatus.setTextColor(getColor(R.color.success));
-                btnStartStop.setEnabled(true);
-                btnStartStop.setText(grabbing ? "停止抢票" : "开始抢票");
-                btnStartStop.setBackgroundColor(getColor(grabbing ? R.color.error : R.color.damai_red));
+        // 定时抢票
+        btnStartScheduled.setOnClickListener(v -> {
+            if (isRunning) {
+                stopGrabbing();
             } else {
-                tvServiceStatus.setText("无障碍服务未开启 ✗");
-                tvServiceStatus.setTextColor(getColor(R.color.warning));
-                btnStartStop.setText("开始抢票");
-                btnStartStop.setEnabled(false);
-                btnStartStop.setBackgroundColor(getColor(R.color.divider));
+                startScheduledGrab();
             }
         });
+
+        // 立即抢票
+        btnStartNow.setOnClickListener(v -> {
+            if (isRunning) {
+                stopGrabbing();
+            } else {
+                startGrabNow();
+            }
+        });
+
+        // 默认时间设置为当前时间+1分钟（方便测试）
+        Calendar cal = Calendar.getInstance();
+        cal.add(Calendar.MINUTE, 1);
+        sliderHour.setValue(cal.get(Calendar.HOUR_OF_DAY));
+        sliderMinute.setValue(cal.get(Calendar.MINUTE));
+        updateTimeDisplay();
+
+        tvSessionVal.setText("1");
+        tvTicketVal.setText("1");
     }
 
-    private void toggleGrabbing() {
+    private void refreshStatus() {
+        // 检查无障碍服务
+        AccessibilityManager am = (AccessibilityManager) getSystemService(Context.ACCESSIBILITY_SERVICE);
+        boolean serviceEnabled = false;
+        if (am != null) {
+            List<AccessibilityServiceInfo> list = am.getEnabledAccessibilityServiceList(
+                    AccessibilityServiceInfo.FEEDBACK_ALL_MASK);
+            for (AccessibilityServiceInfo info : list) {
+                if (info.getId().contains("com.tickethelper")) {
+                    serviceEnabled = true;
+                    break;
+                }
+            }
+        }
+
+        if (serviceEnabled) {
+            tvServiceStatus.setText("● 无障碍服务已开启");
+            tvServiceStatus.setTextColor(getColor(R.color.success));
+            btnOpenSettings.setVisibility(View.GONE);
+        } else {
+            tvServiceStatus.setText("○ 无障碍服务未开启");
+            tvServiceStatus.setTextColor(getColor(R.color.warning));
+            btnOpenSettings.setVisibility(View.VISIBLE);
+        }
+
+        // 检查大麦安装
+        boolean damaiInstalled = AppDetector.isInstalled(this, DAMAI_PACKAGE);
+        if (damaiInstalled) {
+            tvDamaiStatus.setText("● 大麦APP已安装");
+            tvDamaiStatus.setTextColor(getColor(R.color.success));
+            btnOpenDamaiInfo.setVisibility(View.GONE);
+        } else {
+            tvDamaiStatus.setText("○ 大麦APP未安装");
+            tvDamaiStatus.setTextColor(getColor(R.color.error));
+            btnOpenDamaiInfo.setVisibility(View.VISIBLE);
+        }
+
+        if (!serviceEnabled) {
+            btnStartScheduled.setEnabled(false);
+            btnStartNow.setEnabled(false);
+        } else {
+            btnStartScheduled.setEnabled(true);
+            btnStartNow.setEnabled(true);
+        }
+    }
+
+    private void updateTimeDisplay() {
+        int h = (int) sliderHour.getValue();
+        int m = (int) sliderMinute.getValue();
+        tvTimeDisplay.setText(String.format(Locale.CHINA, "开售时间: %02d:%02d", h, m));
+    }
+
+    private void startScheduledGrab() {
+        int hour = (int) sliderHour.getValue();
+        int minute = (int) sliderMinute.getValue();
+
+        Calendar cal = Calendar.getInstance();
+        cal.set(Calendar.HOUR_OF_DAY, hour);
+        cal.set(Calendar.MINUTE, minute);
+        cal.set(Calendar.SECOND, 0);
+        cal.set(Calendar.MILLISECOND, 0);
+
+        long targetTime = cal.getTimeInMillis();
+        long now = System.currentTimeMillis();
+
+        // 如果时间已过，设为明天
+        if (targetTime <= now) {
+            cal.add(Calendar.DAY_OF_MONTH, 1);
+            targetTime = cal.getTimeInMillis();
+        }
+
+        GrabConfig config = new GrabConfig();
+        config.sessionIndex = (int) sliderSession.getValue();
+        config.ticketIndex = (int) sliderTicket.getValue();
+
         GrabAccessibilityService service = GrabAccessibilityService.getInstance();
         if (service == null) {
-            Toast.makeText(this, "无障碍服务未运行，请先在设置中开启", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, "无障碍服务未运行", Toast.LENGTH_SHORT).show();
             return;
         }
 
-        if (service.isGrabbing()) {
-            service.stopGrabbing();
-            updateServiceStatus(true, false);
-            addLog("已手动停止抢票");
-        } else {
-            GrabConfig config = new GrabConfig();
-            config.sessionIndex = (int) sliderSession.getValue();
-            config.ticketIndex = (int) sliderTicket.getValue();
-            config.clickInterval = (int) sliderInterval.getValue();
-            config.maxRetry = (int) sliderRetry.getValue();
+        service.setConfig(config);
+        service.setCallback(this);
+        service.startScheduledGrab(targetTime);
+        isRunning = true;
 
-            service.setStateCallback(this);
-            service.startGrabbing(config);
-            updateServiceStatus(true, true);
-            addLog("启动抢票: 场次" + (config.sessionIndex + 1)
-                    + " 票档" + (config.ticketIndex + 1)
-                    + " 间隔" + config.clickInterval + "ms");
-        }
+        btnStartScheduled.setText("取消定时");
+        addLog("已设置定时抢票: " + String.format("%02d:%02d", hour, minute));
+
+        // 启动倒计时UI
+        startCountdownUI(targetTime);
     }
 
-    private void toggleFloatingButton() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            if (!Settings.canDrawOverlays(this)) {
-                Intent intent = new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                        Uri.parse("package:" + getPackageName()));
-                startActivityForResult(intent, OVERLAY_PERMISSION_REQUEST);
-                return;
+    private void startGrabNow() {
+        GrabConfig config = new GrabConfig();
+        config.sessionIndex = (int) sliderSession.getValue();
+        config.ticketIndex = (int) sliderTicket.getValue();
+
+        GrabAccessibilityService service = GrabAccessibilityService.getInstance();
+        if (service == null) {
+            Toast.makeText(this, "无障碍服务未运行", Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        service.setConfig(config);
+        service.setCallback(this);
+        service.startGrabbing();
+        isRunning = true;
+
+        btnStartNow.setText("停止抢票");
+        addLog("立即抢票已启动");
+        tvStepStatus.setText("正在抢票...");
+    }
+
+    private void stopGrabbing() {
+        GrabAccessibilityService service = GrabAccessibilityService.getInstance();
+        if (service != null) service.stopGrabbing();
+        isRunning = false;
+        if (countDownTimer != null) countDownTimer.cancel();
+
+        btnStartScheduled.setText("定时抢票");
+        btnStartNow.setText("立即抢票");
+        tvCountdown.setText("");
+        addLog("已停止");
+    }
+
+    private void startCountdownUI(long targetTime) {
+        long now = System.currentTimeMillis();
+        long total = targetTime - now;
+        if (total <= 0) return;
+
+        if (countDownTimer != null) countDownTimer.cancel();
+        countDownTimer = new CountDownTimer(total, 1000) {
+            @Override
+            public void onTick(long millisUntilFinished) {
+                long sec = millisUntilFinished / 1000;
+                String text = String.format(Locale.CHINA,
+                        "距开售: %02d:%02d:%02d", sec / 3600, (sec % 3600) / 60, sec % 60);
+                tvCountdown.setText(text);
             }
-        }
-        // 开启/关闭悬浮按钮
-        if (btnFloatToggle.getText().toString().contains("开启")) {
-            startFloatingService();
-        } else {
-            stopFloatingService();
-        }
-    }
 
-    private void startFloatingService() {
-        Intent intent = new Intent(this, FloatingButtonService.class);
-        intent.setAction("START");
-        startService(intent);
-        btnFloatToggle.setText("关闭悬浮按钮");
-        addLog("悬浮按钮已显示");
-    }
-
-    private void stopFloatingService() {
-        Intent intent = new Intent(this, FloatingButtonService.class);
-        intent.setAction("STOP");
-        startService(intent);
-        btnFloatToggle.setText("开启悬浮按钮");
-        addLog("悬浮按钮已隐藏");
-    }
-
-    private void openAccessibilitySettings() {
-        Intent intent = new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS);
-        startActivity(intent);
-        Toast.makeText(this, "请找到「抢票助手」并开启无障碍服务", Toast.LENGTH_LONG).show();
-    }
-
-    private void openDamai() {
-        try {
-            Intent intent = getPackageManager().getLaunchIntentForPackage(DAMAI_PACKAGE);
-            if (intent != null) {
-                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-                startActivity(intent);
-                addLog("已打开大麦APP");
-            } else {
-                Toast.makeText(this, "未安装大麦APP", Toast.LENGTH_SHORT).show();
-                addLog("未找到大麦APP");
+            @Override
+            public void onFinish() {
+                tvCountdown.setText("开售中!");
             }
-        } catch (Exception e) {
-            Log.e(TAG, "打开大麦失败", e);
-            Toast.makeText(this, "打开大麦失败", Toast.LENGTH_SHORT).show();
-        }
+        }.start();
     }
+
+    // ===== GrabState.Callback =====
 
     @Override
-    public void onStateChanged(int step, String message) {
+    public void onStateChange(int step, String message) {
         runOnUiThread(() -> {
-            tvStepStatus.setText(GrabState.getStepName(step));
+            tvStepStatus.setText(message);
             addLog(message);
-            if (step == GrabState.STEP_DONE) {
-                Toast.makeText(this, "已跳转支付宝，抢票完成！", Toast.LENGTH_LONG).show();
+
+            if (step == GrabState.DONE) {
+                tvStepStatus.setText("🎉 抢票成功！已跳转支付宝");
+                isRunning = false;
+                btnStartScheduled.setText("定时抢票");
+                btnStartNow.setText("立即抢票");
+                tvCountdown.setText("");
+                if (countDownTimer != null) countDownTimer.cancel();
+            } else if (step == GrabState.ERROR || step == GrabState.IDLE) {
+                isRunning = false;
+                btnStartScheduled.setText("定时抢票");
+                btnStartNow.setText("立即抢票");
+                tvCountdown.setText("");
             }
         });
     }
 
-    private void addLog(String message) {
-        String time = java.text.DateFormat.getTimeInstance(java.text.DateFormat.MEDIUM)
-                .format(new java.util.Date());
-        String logLine = "[" + time + "] " + message + "\n";
-        logBuilder.insert(0, logLine);
-        if (logBuilder.length() > 5000) {
-            logBuilder.setLength(5000);
-        }
+    private void addLog(String msg) {
+        String time = new SimpleDateFormat("HH:mm:ss", Locale.CHINA).format(new Date());
+        logBuilder.insert(0, "[" + time + "] " + msg + "\n");
+        if (logBuilder.length() > 3000) logBuilder.setLength(3000);
         tvLog.setText(logBuilder.toString());
     }
 }

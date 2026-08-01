@@ -1,36 +1,30 @@
 package com.tickethelper.service;
 
 import android.accessibilityservice.AccessibilityService;
-import android.accessibilityservice.GestureDescription;
 import android.content.Intent;
-import android.graphics.Path;
-import android.graphics.Rect;
-import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
 import android.view.accessibility.AccessibilityEvent;
-import android.view.accessibility.AccessibilityNodeInfo;
 
-import com.tickethelper.engine.ClickStrategy;
+import com.tickethelper.engine.ClickEngine;
 import com.tickethelper.engine.GrabConfig;
 import com.tickethelper.engine.GrabState;
-
-import java.util.ArrayList;
-import java.util.List;
+import com.tickethelper.engine.ScheduledTask;
 
 public class GrabAccessibilityService extends AccessibilityService {
     private static final String TAG = "GrabService";
-    private static final String TARGET_PACKAGE = "com.damai";
-    private static final String ALIPAY_PACKAGE = "com.eg.android.AlipayGphone";
-
     private static GrabAccessibilityService instance;
-    private boolean isGrabbing = false;
-    private int currentStep = 0;
-    private int retryCount = 0;
-    private GrabConfig config;
+
     private final Handler handler = new Handler(Looper.getMainLooper());
-    private GrabState.StateCallback stateCallback;
+    private ClickEngine clickEngine;
+    private ScheduledTask scheduledTask;
+
+    private boolean isGrabbing = false;
+    private int currentStep = GrabState.IDLE;
+    private int retryCount = 0;
+    private GrabConfig config = new GrabConfig();
+    private GrabState.Callback stateCallback;
 
     public static GrabAccessibilityService getInstance() {
         return instance;
@@ -40,193 +34,183 @@ public class GrabAccessibilityService extends AccessibilityService {
     public void onCreate() {
         super.onCreate();
         instance = this;
-        Log.i(TAG, "无障碍服务已创建");
+        clickEngine = new ClickEngine(this);
+        scheduledTask = new ScheduledTask();
+        Log.i(TAG, "无障碍服务已启动");
     }
 
     @Override
     public void onDestroy() {
-        instance = null;
         stopGrabbing();
+        instance = null;
         Log.i(TAG, "无障碍服务已销毁");
     }
 
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
-        if (!isGrabbing || event.getPackageName() == null) return;
+        if (!isGrabbing) return;
+        String pkg = event.getPackageName() != null ? event.getPackageName().toString() : "";
 
-        String pkg = event.getPackageName().toString();
-        if (pkg.equals(ALIPAY_PACKAGE)) {
-            onAlipayDetected();
+        // 支付宝检测
+        if (pkg.contains("alipay") || pkg.contains("Alipay")) {
+            Log.i(TAG, "检测到支付宝!");
+            onPaymentDetected();
             return;
         }
-        if (!pkg.equals(TARGET_PACKAGE)) return;
 
-        Log.d(TAG, "大麦事件: type=" + event.getEventType() + " className=" + event.getClassName());
-        executeCurrentStep();
+        // 大麦页面变化 => 执行当前步骤
+        if (pkg.equals(config.damaiPackage)) {
+            executeCurrentStep();
+        }
     }
 
     @Override
     public void onInterrupt() {
-        Log.i(TAG, "无障碍服务被中断");
+        Log.i(TAG, "服务中断");
     }
 
-    public void startGrabbing(GrabConfig config) {
-        this.config = config;
-        this.isGrabbing = true;
-        this.currentStep = 0;
-        this.retryCount = 0;
-        Log.i(TAG, "开始抢票流程, 配置=" + config);
-        updateState(GrabState.STEP_WAIT, "抢票流程已启动");
-        handler.postDelayed(this::executeCurrentStep, config.clickInterval);
+    // ===== 公开API =====
+
+    public void setConfig(GrabConfig cfg) {
+        this.config = cfg;
     }
 
-    public void stopGrabbing() {
-        this.isGrabbing = false;
-        this.retryCount = 0;
-        handler.removeCallbacksAndMessages(null);
-        Log.i(TAG, "抢票流程已停止");
-        updateState(GrabState.STEP_IDLE, "已停止");
+    public void setCallback(GrabState.Callback cb) {
+        this.stateCallback = cb;
     }
 
     public boolean isGrabbing() {
         return isGrabbing;
     }
 
-    public void setStateCallback(GrabState.StateCallback callback) {
-        this.stateCallback = callback;
+    public int getCurrentStep() {
+        return currentStep;
     }
+
+    // ===== 控制 =====
+
+    public void startScheduledGrab(long startTimeMillis) {
+        config.startTimeMillis = startTimeMillis;
+        isGrabbing = true;
+        currentStep = GrabState.WAITING;
+        notifyState("等待开售");
+
+        scheduledTask.startCountdown(startTimeMillis, 1000, new ScheduledTask.TaskCallback() {
+            @Override
+            public void onTick(long remaining) {
+                String msg = "距离开售: " + (remaining / 1000) + "秒";
+                notifyState(msg);
+            }
+
+            @Override
+            public void onTimeUp() {
+                Log.i(TAG, "开售时间到！开始抢票");
+                notifyState("开售时间到！");
+                currentStep = GrabState.CLICK_BUY;
+                retryCount = 0;
+                handler.postDelayed(() -> executeCurrentStep(), 100);
+            }
+        });
+    }
+
+    public void startGrabbing() {
+        isGrabbing = true;
+        currentStep = GrabState.CLICK_BUY;
+        retryCount = 0;
+        notifyState("开始抢票");
+        handler.postDelayed(this::executeCurrentStep, 200);
+    }
+
+    public void stopGrabbing() {
+        isGrabbing = false;
+        retryCount = 0;
+        scheduledTask.stop();
+        handler.removeCallbacksAndMessages(null);
+        currentStep = GrabState.IDLE;
+        notifyState("已停止");
+        Log.i(TAG, "抢票停止");
+    }
+
+    // ===== 核心执行 =====
 
     private void executeCurrentStep() {
         if (!isGrabbing) return;
 
-        AccessibilityNodeInfo root = getRootInActiveWindow();
-        if (root == null) {
-            Log.w(TAG, "获取根节点失败，重试中...");
-            scheduleRetry();
-            return;
-        }
-
         switch (currentStep) {
-            case GrabState.STEP_BUY:
-                tryClickText(root, "立即购买", () -> advanceStep(GrabState.STEP_SUBMIT, "点击立即购买"));
-                tryClickText(root, "选座购买", () -> advanceStep(GrabState.STEP_SUBMIT, "点击选座购买"));
-                tryClickText(root, "马上预订", () -> advanceStep(GrabState.STEP_SUBMIT, "点击马上预订"));
-                tryClickSessionItem(root);
+            case GrabState.CLICK_BUY:
+                tryClickBuy();
                 break;
-            case GrabState.STEP_SUBMIT:
-                tryClickText(root, "提交订单", () -> advanceStep(GrabState.STEP_PAY, "点击提交订单"));
-                tryClickText(root, "立即支付", () -> advanceStep(GrabState.STEP_PAY, "点击立即支付"));
-                tryClickText(root, "去支付", () -> advanceStep(GrabState.STEP_PAY, "点击去支付"));
+            case GrabState.CLICK_SUBMIT:
+                tryClickSubmit();
                 break;
-            case GrabState.STEP_PAY:
-                tryClickText(root, "支付宝", () -> advanceStep(GrabState.STEP_DONE, "选择支付宝支付"));
-                tryClickText(root, "确认支付", () -> advanceStep(GrabState.STEP_DONE, "点击确认支付"));
-                break;
-            default:
+            case GrabState.CLICK_PAY:
+                tryClickPay();
                 break;
         }
-        root.recycle();
-        scheduleRetry();
     }
 
-    private void tryClickText(AccessibilityNodeInfo root, String text, Runnable onSuccess) {
-        List<AccessibilityNodeInfo> nodes = findNodesByText(root, text);
-        for (AccessibilityNodeInfo node : nodes) {
-            if (node != null && node.isVisibleToUser() && node.isEnabled()) {
-                ClickStrategy.clickNode(node);
-                Log.i(TAG, "找到目标: " + text + "，执行点击");
-                onSuccess.run();
+    private void tryClickBuy() {
+        if (clickEngine.findAndClick(GrabConfig.BUY_BUTTONS)) {
+            retryCount = 0;
+            currentStep = GrabState.CLICK_SUBMIT;
+            notifyState("已点击购买按钮");
+            handler.postDelayed(this::executeCurrentStep, config.clickInterval);
+        } else {
+            retryCount++;
+            if (retryCount > config.maxRetry) {
+                notifyState("购买按钮未找到，停止");
+                isGrabbing = false;
                 return;
             }
+            handler.postDelayed(this::executeCurrentStep, config.clickInterval);
         }
     }
 
-    private void tryClickSessionItem(AccessibilityNodeInfo root) {
-        List<AccessibilityNodeInfo> buttons = findNodesByClassName(root, "android.widget.Button");
-        List<AccessibilityNodeInfo> texts = findNodesByClassName(root, "android.widget.TextView");
-        int targetIndex = config != null ? config.sessionIndex : 0;
-
-        if (!buttons.isEmpty() && targetIndex < buttons.size()) {
-            ClickStrategy.clickNode(buttons.get(targetIndex));
-            Log.i(TAG, "点击第" + (targetIndex + 1) + "个按钮");
-            advanceStep(GrabState.STEP_SUBMIT, "选择场次");
-        } else if (!texts.isEmpty() && targetIndex < texts.size()) {
-            ClickStrategy.clickNode(texts.get(targetIndex));
-            Log.i(TAG, "点击第" + (targetIndex + 1) + "个文本");
-            advanceStep(GrabState.STEP_SUBMIT, "选择场次");
-        }
-    }
-
-    private List<AccessibilityNodeInfo> findNodesByText(AccessibilityNodeInfo node, String text) {
-        List<AccessibilityNodeInfo> results = new ArrayList<>();
-        if (node == null) return results;
-
-        int childCount = node.getChildCount();
-        for (int i = 0; i < childCount; i++) {
-            AccessibilityNodeInfo child = node.getChild(i);
-            if (child == null) continue;
-
-            CharSequence nodeText = child.getText();
-            CharSequence contentDesc = child.getContentDescription();
-            String viewId = child.getViewIdResourceName();
-
-            if ((nodeText != null && nodeText.toString().contains(text))
-                    || (contentDesc != null && contentDesc.toString().contains(text))
-                    || (viewId != null && viewId.contains(text))) {
-                results.add(child);
+    private void tryClickSubmit() {
+        if (clickEngine.findAndClick(GrabConfig.SUBMIT_BUTTONS)) {
+            retryCount = 0;
+            currentStep = GrabState.CLICK_PAY;
+            notifyState("已提交订单");
+            handler.postDelayed(this::executeCurrentStep, config.clickInterval);
+        } else {
+            retryCount++;
+            if (retryCount > config.maxRetry) {
+                notifyState("提交按钮未找到，停止");
+                isGrabbing = false;
+                return;
             }
-            results.addAll(findNodesByText(child, text));
+            handler.postDelayed(this::executeCurrentStep, config.clickInterval);
         }
-        return results;
     }
 
-    private List<AccessibilityNodeInfo> findNodesByClassName(AccessibilityNodeInfo node, String className) {
-        List<AccessibilityNodeInfo> results = new ArrayList<>();
-        if (node == null) return results;
-
-        if (className.equals(node.getClassName().toString())) {
-            results.add(node);
-        }
-        int childCount = node.getChildCount();
-        for (int i = 0; i < childCount; i++) {
-            AccessibilityNodeInfo child = node.getChild(i);
-            if (child != null) {
-                results.addAll(findNodesByClassName(child, className));
-            }
-        }
-        return results;
-    }
-
-    private void advanceStep(int nextStep, String action) {
-        retryCount = 0;
-        currentStep = nextStep;
-        updateState(currentStep, action + " - 成功");
-        Log.i(TAG, "进入步骤: " + currentStep);
-        handler.postDelayed(this::executeCurrentStep, config != null ? config.clickInterval : 500);
-    }
-
-    private void scheduleRetry() {
-        if (!isGrabbing) return;
-        retryCount++;
-        int maxRetry = config != null ? config.maxRetry : 30;
-        if (retryCount > maxRetry) {
-            Log.w(TAG, "重试超限，停止流程");
-            updateState(GrabState.STEP_IDLE, "重试超限，未找到目标");
+    private void tryClickPay() {
+        if (clickEngine.findAndClick(GrabConfig.PAY_BUTTONS)) {
+            retryCount = 0;
+            currentStep = GrabState.DONE;
+            notifyState("已跳转支付");
             isGrabbing = false;
-            return;
+        } else {
+            retryCount++;
+            if (retryCount > config.maxRetry) {
+                notifyState("支付按钮未找到，停止");
+                isGrabbing = false;
+                return;
+            }
+            handler.postDelayed(this::executeCurrentStep, config.clickInterval);
         }
-        handler.postDelayed(this::executeCurrentStep, config != null ? config.clickInterval : 500);
     }
 
-    private void onAlipayDetected() {
-        Log.i(TAG, "检测到支付宝APP启动，抢票成功！");
+    private void onPaymentDetected() {
+        currentStep = GrabState.DONE;
         isGrabbing = false;
-        updateState(GrabState.STEP_DONE, "已跳转支付宝，抢票完成！");
+        scheduledTask.stop();
+        notifyState("已跳转支付宝，抢票成功！");
     }
 
-    private void updateState(int step, String message) {
+    private void notifyState(String message) {
+        Log.i(TAG, message);
         if (stateCallback != null) {
-            stateCallback.onStateChanged(step, message);
+            stateCallback.onStateChange(currentStep, message);
         }
     }
 }

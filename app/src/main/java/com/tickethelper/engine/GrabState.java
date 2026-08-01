@@ -1,25 +1,28 @@
 package com.tickethelper.engine;
 
 public class GrabState {
-    public static final int STEP_IDLE = -1;
-    public static final int STEP_WAIT = 0;
-    public static final int STEP_BUY = 1;
-    public static final int STEP_SUBMIT = 2;
-    public static final int STEP_PAY = 3;
-    public static final int STEP_DONE = 4;
+    public static final int IDLE = -1;
+    public static final int WAITING = 0;
+    public static final int CLICK_BUY = 1;
+    public static final int CLICK_SUBMIT = 2;
+    public static final int CLICK_PAY = 3;
+    public static final int DONE = 4;
+    public static final int ERROR = 5;
 
     public static String getStepName(int step) {
         switch (step) {
-            case STEP_WAIT: return "等待开始";
-            case STEP_BUY: return "点击购买";
-            case STEP_SUBMIT: return "提交订单";
-            case STEP_PAY: return "选择支付";
-            case STEP_DONE: return "支付跳转";
-            default: return "未启动";
+            case IDLE: return "待命";
+            case WAITING: return "等待开售";
+            case CLICK_BUY: return "点击购买";
+            case CLICK_SUBMIT: return "提交订单";
+            case CLICK_PAY: return "跳转支付";
+            case DONE: return "抢票成功!";
+            case ERROR: return "出错";
+            default: return "未知";
         }
     }
 
-    public interface StateCallback {
-        void onStateChanged(int step, String message);
+    public interface Callback {
+        void onStateChange(int step, String message);
     }
 }
